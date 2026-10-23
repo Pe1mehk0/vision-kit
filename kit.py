@@ -159,14 +159,18 @@ def split_by_group(images, group_of, out_dir, val_groups, test_groups, names):
 
 # ----------------------------------------------------------------- runs
 def runs_summary(project, names=None):
-    """Best mAP50 / mAP50-95 for every run folder (reads results.csv)."""
-    import pandas as pd
+    """Best mAP50 / mAP50-95 for every run folder (reads results.csv). No pandas needed.
+    'best epoch = last epoch' means it was still improving: train longer."""
+    import csv
     for n in (names or sorted(os.listdir(project))):
         f = Path(project) / n / 'results.csv'
         if not f.exists(): print(f'{n:18s} - no results yet'); continue
-        d = pd.read_csv(f); d.columns = d.columns.str.strip(); b = d.loc[d['metrics/mAP50-95(B)'].idxmax()]
-        print(f"{n:18s} epoch {int(d['epoch'].iloc[-1]):3d} | best mAP50 {d['metrics/mAP50(B)'].max():.3f} | "
-              f"best mAP50-95 {b['metrics/mAP50-95(B)']:.3f} (epoch {int(b['epoch'])})")
+        rows = [{k.strip(): v for k, v in r.items()} for r in csv.DictReader(open(f))]
+        if not rows: print(f'{n:18s} - empty'); continue
+        m50 = [float(r['metrics/mAP50(B)']) for r in rows]; m95 = [float(r['metrics/mAP50-95(B)']) for r in rows]
+        i = int(np.argmax(m95)); last = int(float(rows[-1]['epoch']))
+        flag = '  <- still improving at the end' if i == len(rows) - 1 else ''
+        print(f"{n:18s} epoch {last:3d} | best mAP50 {max(m50):.3f} | best mAP50-95 {m95[i]:.3f} (epoch {int(float(rows[i]['epoch']))}){flag}")
 
 def ms_per_frame(weights, img_dir, imgsz=640, n=200):
     """Real speed: one frame at a time after 10 warm-up frames. Only on an idle GPU!"""
@@ -191,6 +195,54 @@ def conf_sweep(weights, data_yaml, split='val', grid=(0.1, 0.25, 0.4, 0.55, 0.7)
     for c in grid:
         r = m.val(data=data_yaml, split=split, conf=c, verbose=False, plots=False)
         print(f'conf {c:.2f} | P {r.box.mp:.3f} | R {r.box.mr:.3f} | mAP50 {r.box.map50:.3f}')
+
+def report(weights, data_yaml, split='test', speed_dir=None):
+    """Plain-text summary safe to paste to Claude (numbers only, no images or labels)."""
+    from ultralytics import YOLO
+    m = YOLO(weights); r = m.val(data=data_yaml, split=split, verbose=False, plots=False)
+    print(f'{Path(weights).parent.parent.name} on {split}: mAP50 {r.box.map50:.3f} | mAP50-95 {r.box.map:.3f} | P {r.box.mp:.3f} | R {r.box.mr:.3f}')
+    for i, ap50, ap in zip(r.box.ap_class_index, r.box.ap50, r.box.ap):
+        print(f'  class {int(i):2d} {m.names[int(i)]:14s} AP50 {ap50:.3f} | AP50-95 {ap:.3f}')
+    if speed_dir: ms_per_frame(weights, speed_dir)
+
+def threshold_for_scoring(weights, data_yaml, split='val', fp_cost=1.0, fn_cost=1.0,
+                          grid=(0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7)):
+    """Pick the confidence threshold that minimises fp_cost*FP + fn_cost*FN (set the costs from THEIR scoring).
+    Counts boxes at IoU>=0.5 per class. Tune on val, then confirm on test."""
+    from ultralytics import YOLO
+    m = YOLO(weights); cfg = yaml.safe_load(open(data_yaml)); root = Path(cfg.get('path', Path(data_yaml).parent))
+    img_dir = root / cfg[split]; lbl_dir = Path(str(img_dir).replace('images', 'labels')); data = []
+    for r in m.predict(str(img_dir), conf=min(grid), verbose=False, stream=True):
+        H, W = r.orig_shape; lf = lbl_dir / (Path(r.path).stem + '.txt')
+        g = np.loadtxt(lf, ndmin=2) if lf.exists() and lf.stat().st_size else np.zeros((0, 5))
+        gb = np.stack([(g[:, 1] - g[:, 3]/2) * W, (g[:, 2] - g[:, 4]/2) * H, (g[:, 1] + g[:, 3]/2) * W, (g[:, 2] + g[:, 4]/2) * H], 1)
+        data.append((g[:, 0].astype(int), gb, r.boxes.cls.cpu().numpy().astype(int), r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()))
+    best = None
+    print(f'cost = {fp_cost}*FP + {fn_cost}*FN')
+    for t in grid:
+        TP = FP = FN = 0
+        for gc, gb, pc, pb, ps in data:
+            k = ps >= t; tp, fp, fn = _match(pc[k], pb[k], ps[k], gc, gb); TP += tp; FP += fp; FN += fn
+        cost = fp_cost * FP + fn_cost * FN
+        print(f'  conf {t:.2f} | TP {TP:5d} FP {FP:5d} FN {FN:5d} | cost {cost:8.1f}')
+        if best is None or cost < best[1]: best = (t, cost)
+    print(f'best threshold {best[0]:.2f} (cost {best[1]:.1f})'); return best[0]
+
+def _iou(a, b):
+    x1 = np.maximum(a[:, None, 0], b[None, :, 0]); y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+    x2 = np.minimum(a[:, None, 2], b[None, :, 2]); y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+    inter = (x2 - x1).clip(0) * (y2 - y1).clip(0); area = lambda r: (r[:, 2] - r[:, 0]) * (r[:, 3] - r[:, 1])
+    return inter / (area(a)[:, None] + area(b)[None, :] - inter + 1e-9)
+
+def _match(pc, pb, ps, gc, gb, iou_thr=0.5):
+    """Greedy match by confidence: right class + IoU>=0.5 = TP; else FP; unmatched ground truth = FN."""
+    o = np.argsort(-ps); pc, pb = pc[o], pb[o]; matched = np.zeros(len(gc), bool); tp = fp = 0
+    I = _iou(pb, gb) if len(pb) and len(gc) else np.zeros((len(pb), len(gc)))
+    for i in range(len(pb)):
+        cand = np.where((gc == pc[i]) & ~matched & (I[i] >= iou_thr))[0]
+        if len(cand): matched[cand[np.argmax(I[i, cand])]] = True; tp += 1
+        else: fp += 1
+    return tp, fp, int((~matched).sum())
 
 # ----------------------------------------------------------------- robustness (sim-to-real)
 _rng = np.random.default_rng(0)
@@ -262,22 +314,41 @@ def harsh_eval(models, clean_yaml, harsh_root, clean_split='test', conds=None):
     print(f"{'avg damaged':10s}" + ''.join(f'{np.mean([rows[(c, mn)] for c in conds]):12.3f}' for mn in models))
     return rows
 
-def offline_augment(train_img_dir, train_lbl_dir, out_dir, seed=1):
-    """Clean + one randomly damaged copy per training image (red/noise/motion/blur/dark, random strengths)."""
-    rng = np.random.default_rng(seed)
+def offline_augment(train_img_dir, train_lbl_dir, out_dir, copies=1, strength=1.0, max_ops=2, seed=1,
+                    ops=('red', 'blue', 'noise', 'motion', 'blur', 'dark', 'bright', 'smoke', 'glare', 'jpeg')):
+    """Clean images + `copies` damaged copies each. Every copy gets 1..max_ops random damages at random strength.
+    strength scales all damages (0.5 = mild, 1 = like the harsh test, 1.5 = strong). Labels unchanged (no geometry).
+    To test generalisation honestly, leave some ops OUT here and keep them in make_harsh."""
+    rng = np.random.default_rng(seed); s = float(strength)
+    def u(a, b): return a + (b - a) * rng.random()
     def red(im):
-        f = im.astype(np.float32); f[..., 2] *= rng.uniform(1.05, 1.3); f[..., :2] *= rng.uniform(0.7, 0.95); return f.clip(0, 255).astype(np.uint8)
-    def noise(im): return (im.astype(np.float32) + rng.normal(0, rng.uniform(5, 25), im.shape)).clip(0, 255).astype(np.uint8)
+        f = im.astype(np.float32); f[..., 2] *= 1 + u(0.05, 0.3) * s; f[..., :2] *= 1 - u(0.05, 0.3) * s; return f
+    def blue(im):
+        f = im.astype(np.float32); f[..., 0] *= 1 + u(0.05, 0.25) * s; f[..., 2] *= 1 - u(0.05, 0.2) * s; return f
+    def noise(im): return im.astype(np.float32) + rng.normal(0, u(4, 22) * s, im.shape)
     def motion(im):
-        L = int(rng.integers(5, 22)); k = np.zeros((L, L), np.float32); k[L // 2, :] = 1
-        k = cv2.warpAffine(k, cv2.getRotationMatrix2D(((L-1)/2, (L-1)/2), float(rng.uniform(0, 180)), 1), (L, L)); k /= k.sum()
-        return cv2.filter2D(im, -1, k)
-    def blur(im): return cv2.GaussianBlur(im, (0, 0), float(rng.uniform(1, 4)))
-    def dark(im): return (im.astype(np.float32) * rng.uniform(0.35, 0.8)).clip(0, 255).astype(np.uint8)
-    fns = [red, noise, motion, blur, dark]; out = Path(out_dir)
+        L = max(3, int(u(3, 21) * s)); k = np.zeros((L, L), np.float32); k[L // 2, :] = 1
+        k = cv2.warpAffine(k, cv2.getRotationMatrix2D(((L-1)/2, (L-1)/2), u(0, 180), 1), (L, L)); k /= max(k.sum(), 1e-6)
+        return cv2.filter2D(im, -1, k).astype(np.float32)
+    def blur(im): return cv2.GaussianBlur(im, (0, 0), u(0.8, 3.5) * s).astype(np.float32)
+    def dark(im): return im.astype(np.float32) * (1 - u(0.2, 0.6) * min(s, 1.4))
+    def bright(im): return im.astype(np.float32) * (1 + u(0.1, 0.5) * s)
+    def smoke(im): return c_smoke(im.clip(0, 255).astype(np.uint8)).astype(np.float32)
+    def glare(im): return c_glare(im.clip(0, 255).astype(np.uint8)).astype(np.float32)
+    def jpeg(im):
+        q = int(np.clip(90 - u(20, 70) * s, 10, 95))
+        return cv2.imdecode(cv2.imencode('.jpg', im.clip(0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, q])[1], 1).astype(np.float32)
+    table = dict(red=red, blue=blue, noise=noise, motion=motion, blur=blur, dark=dark, bright=bright, smoke=smoke, glare=glare, jpeg=jpeg)
+    fns = [table[o] for o in ops]; out = Path(out_dir); used = collections.Counter()
     for sub in ('images', 'labels'): (out / sub).mkdir(parents=True, exist_ok=True)
     for p in _imgs(train_img_dir):
         lab = Path(train_lbl_dir) / (p.stem + '.txt'); shutil.copy(p, out / 'images' / p.name)
-        if lab.exists(): shutil.copy(lab, out / 'labels' / lab.name); shutil.copy(lab, out / 'labels' / (p.stem + '_aug.txt'))
-        cv2.imwrite(str(out / 'images' / (p.stem + '_aug.jpg')), fns[int(rng.integers(len(fns)))](cv2.imread(str(p))))
-    print(len(_imgs(out / 'images')), 'training images in', out)
+        if lab.exists(): shutil.copy(lab, out / 'labels' / lab.name)
+        im0 = cv2.imread(str(p))
+        for c in range(copies):
+            im = im0.astype(np.float32)
+            for j in rng.choice(len(fns), size=int(rng.integers(1, max_ops + 1)), replace=False):
+                im = fns[j](im.clip(0, 255).astype(np.uint8)); used[ops[j]] += 1
+            cv2.imwrite(str(out / 'images' / f'{p.stem}_aug{c}.jpg'), im.clip(0, 255).astype(np.uint8))
+            if lab.exists(): shutil.copy(lab, out / 'labels' / f'{p.stem}_aug{c}.txt')
+    print(len(_imgs(out / 'images')), 'training images in', out, '| damage used:', dict(used))

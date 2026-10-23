@@ -69,9 +69,16 @@ Progress: `runs_summary('RUNS')` · GPU: `nvidia-smi --query-compute-apps=pid,us
 ```python
 make_harsh('test/images', 'test/labels', 'harsh', names)        # check harsh/preview.png first
 harsh_eval({'base': 'RUNS/base/weights/best.pt', 'aug': 'RUNS/aug/weights/best.pt'}, 'data.yaml', 'harsh')
-conf_sweep('RUNS/aug/weights/best.pt', 'data.yaml')             # pick threshold from their FP/FN scoring
+report('RUNS/aug/weights/best.pt', 'data.yaml', split='test')   # plain-text numbers, safe to paste to Claude
+t = threshold_for_scoring('RUNS/aug/weights/best.pt', 'data.yaml', split='val', fp_cost=1, fn_cost=1)
+#   ^ set fp_cost / fn_cost from THEIR scoring rule; tune on val, confirm on test
 ```
-Need stronger robustness than the built-in knobs? `offline_augment('train/images', 'train/labels', 'aug/train')`, then train on it.
+Need stronger robustness than the built-in knobs?
+```python
+offline_augment('train/images', 'train/labels', 'aug/train', copies=1, strength=1.0, max_ops=2)
+# 10 damage types (colour casts, noise, motion, blur, dark/bright, smoke, glare, jpeg); pass ops=(...) to hold some out
+```
+Then train on a data.yaml whose train points at `aug/train/images`.
 
 ## 4. Speed and submit (by 16:30)
 
