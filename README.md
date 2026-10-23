@@ -4,13 +4,14 @@ My own code for Saturday. Contains **no XRlabs data**. Never commit their data, 
 
 ## 0. Setup (every new session)
 
-**Launch the Brev instance at ~10:05** (takes ~7 min to boot). L4, 1 GPU, "VM Mode w/ Jupyter", an option with stop/start. Open JupyterLab → Notebook → Python 3.
+**Launch the Brev instance at ~10:05** (takes ~7 min to boot). L4, 1 GPU, "VM Mode w/ Jupyter", an option with stop/start. **Pick 8 CPUs if offered** (4 CPUs starved the augmented run on 23 Oct). Open JupyterLab → Notebook → Python 3.
 
 **Cell 1 (raw Brev VM: no pip, no libGL; fixes found 23 Oct):**
 ```python
 import sys
 !{sys.executable} -m ensurepip --upgrade
 !{sys.executable} -m pip install -q ultralytics lap roboflow
+!{sys.executable} -m pip install -q "nvidia-modelopt[onnx]>=0.44"   # TensorRT 11 FP16 needs it; Ultralytics' auto-install fails (asks for a torch build not on PyPI)
 !sudo apt-get update -qq && sudo apt-get install -y -qq libgl1 libglib2.0-0
 !git clone https://github.com/Pe1mehk0/vision-kit.git
 ```
@@ -104,3 +105,4 @@ ms_per_frame(eng, 'valid/images')
 - Check what a box covers (tool tip vs whole tool). Don't mix datasets with different conventions.
 - Jupyter counters: `[*]` running, `[5]` done, `[ ]` not run / interrupted. Don't restart the kernel while `[*]`.
 - Brev billing: storage keeps charging while stopped. Delete the instance when finished.
+- Brev L4, yolo11n, 640: `.pt` 11.6 ms/frame → TensorRT FP16 engine 3.3 ms/frame (engine build ~2.5 min). Compare mAP of `.pt` and engine on the SAME labels with batch=1.
