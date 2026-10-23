@@ -31,6 +31,34 @@ def write_data_yaml(out_yaml, root, names, train='train/images', val='valid/imag
     yaml.safe_dump(d, open(out_yaml, 'w'), sort_keys=False)
     print('wrote', out_yaml); return str(out_yaml)
 
+def _read_labels(lf):
+    """Read a YOLO label file robustly. Returns (classes, boxes xc,yc,w,h normalised, n_polygon_rows).
+    Polygon (segmentation) rows 'c x1 y1 x2 y2 ...' are converted to their bounding box."""
+    cls, boxes, npoly = [], [], 0
+    if not Path(lf).exists(): return np.zeros(0, int), np.zeros((0, 4)), 0
+    for line in Path(lf).read_text().splitlines():
+        v = line.split()
+        if len(v) < 5: continue
+        c, nums = int(float(v[0])), np.array(v[1:], float)
+        if len(nums) == 4: boxes.append(nums)
+        else:
+            npoly += 1; xs, ys = nums[0::2], nums[1::2]
+            x1, x2, y1, y2 = xs.min(), xs.max(), ys.min(), ys.max()
+            boxes.append([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1])
+        cls.append(c)
+    return np.array(cls, int), np.array(boxes, float).reshape(-1, 4), npoly
+
+def fix_labels(lbl_dir):
+    """Rewrite label files so every row is a box: polygon rows -> bounding boxes.
+    Ultralytics IGNORES images whose labels mix boxes and polygons ('corrupt'), so run this before training."""
+    nfiles = nrows = 0
+    for lf in Path(lbl_dir).glob('*.txt'):
+        c, b, npoly = _read_labels(lf)
+        if npoly:
+            lf.write_text('\n'.join(f'{ci} {x:.6f} {y:.6f} {w:.6f} {h:.6f}' for ci, (x, y, w, h) in zip(c, b)))
+            nfiles += 1; nrows += npoly
+    print(f'{lbl_dir}: converted {nrows} polygon rows in {nfiles} files to boxes')
+
 # ----------------------------------------------------------------- converters
 def yolo_to_coco(img_dir, lbl_dir, names, out_json):
     """YOLO txt -> one COCO JSON. Used for round-trip tests."""
@@ -115,23 +143,22 @@ def label_check(data_yaml, n_show=4, out_png='label_check.png'):
     for split in ('train', 'val', 'test'):
         if split not in cfg: continue
         img_dir = root / cfg[split]; lbl_dir = Path(str(img_dir).replace('images', 'labels'))
-        imgs = _imgs(img_dir); cnt, empty, bad = collections.Counter(), 0, 0
+        imgs = _imgs(img_dir); cnt, empty, bad, poly = collections.Counter(), 0, 0, 0
         for p in imgs:
-            lf = lbl_dir / (p.stem + '.txt')
-            rows = [l.split() for l in lf.read_text().splitlines() if l.strip()] if lf.exists() else []
-            if not rows: empty += 1
-            for r in rows:
-                cnt[names[int(r[0])]] += 1
-                if any(not 0 <= float(v) <= 1 for v in r[1:5]): bad += 1
-        print(f'{split}: {len(imgs)} imgs | {empty} without boxes | {bad} out-of-range boxes | ' +
+            c, b, npoly = _read_labels(lbl_dir / (p.stem + '.txt')); poly += npoly
+            if not len(c): empty += 1
+            for ci, bi in zip(c, b):
+                cnt[names[int(ci)]] += 1
+                if np.any(bi < 0) or np.any(bi > 1): bad += 1
+        warn = f' | {poly} POLYGON rows -> run fix_labels()' if poly else ''
+        print(f'{split}: {len(imgs)} imgs | {empty} without boxes | {bad} out-of-range boxes{warn} | ' +
               ', '.join(f'{k} {v}' for k, v in cnt.most_common()))
         if split == 'train': shown = [(p, lbl_dir) for p in random.sample(imgs, min(n_show, len(imgs)))]
     tiles = []
     for p, lbl_dir in shown:
         im = cv2.imread(str(p)); h, w = im.shape[:2]; lf = lbl_dir / (p.stem + '.txt')
-        for l in (lf.read_text().splitlines() if lf.exists() else []):
-            if not l.strip(): continue
-            c, x, y, bw, bh = map(float, l.split()[:5])
+        cc, bb, _ = _read_labels(lf)
+        for c, (x, y, bw, bh) in zip(cc, bb):
             p1, p2 = (int((x - bw/2) * w), int((y - bh/2) * h)), (int((x + bw/2) * w), int((y + bh/2) * h))
             cv2.rectangle(im, p1, p2, (0, 255, 0), 2); cv2.putText(im, names[int(c)], (p1[0], max(12, p1[1] - 4)), 0, 0.6, (0, 255, 0), 2)
         tiles.append(cv2.resize(im, (480, int(480 * h / w))))
@@ -214,9 +241,9 @@ def threshold_for_scoring(weights, data_yaml, split='val', fp_cost=1.0, fn_cost=
     img_dir = root / cfg[split]; lbl_dir = Path(str(img_dir).replace('images', 'labels')); data = []
     for r in m.predict(str(img_dir), conf=min(grid), verbose=False, stream=True):
         H, W = r.orig_shape; lf = lbl_dir / (Path(r.path).stem + '.txt')
-        g = np.loadtxt(lf, ndmin=2) if lf.exists() and lf.stat().st_size else np.zeros((0, 5))
-        gb = np.stack([(g[:, 1] - g[:, 3]/2) * W, (g[:, 2] - g[:, 4]/2) * H, (g[:, 1] + g[:, 3]/2) * W, (g[:, 2] + g[:, 4]/2) * H], 1)
-        data.append((g[:, 0].astype(int), gb, r.boxes.cls.cpu().numpy().astype(int), r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()))
+        gc, g, _ = _read_labels(lf)
+        gb = np.stack([(g[:, 0] - g[:, 2]/2) * W, (g[:, 1] - g[:, 3]/2) * H, (g[:, 0] + g[:, 2]/2) * W, (g[:, 1] + g[:, 3]/2) * H], 1)
+        data.append((gc, gb, r.boxes.cls.cpu().numpy().astype(int), r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()))
     best = None
     print(f'cost = {fp_cost}*FP + {fn_cost}*FN')
     for t in grid:

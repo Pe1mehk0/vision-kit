@@ -40,6 +40,8 @@ Then:
 ```python
 round_trip_test('valid/images', 'valid/labels', names)   # converters still correct (~0 difference)
 label_check('data.yaml')                                  # counts per class + label_check.png: boxes on tools?
+# "POLYGON rows" warning? -> fix_labels('train/labels'); fix_labels('valid/labels'); fix_labels('test/labels')
+# (Ultralytics silently drops images whose labels mix boxes and polygons; found on Cholec80, 23 Oct)
 ```
 **From videos? Split by video before anything else:**
 ```python
