@@ -208,19 +208,32 @@ def c_red(im):
     f = im.astype(np.float32); f[..., 2] *= 1.25; f[..., :2] *= 0.75; return f.clip(0, 255).astype(np.uint8)
 def c_noise(im):  return (im.astype(np.float32) + _rng.normal(0, 18, im.shape)).clip(0, 255).astype(np.uint8)
 def c_smoke(im):
+    """Patchy cautery smoke: a few soft whitish plumes over part of the view (not a uniform veil). Border stays black."""
     H, W = im.shape[:2]
-    f = cv2.GaussianBlur(cv2.resize(_rng.random((4, 7)).astype(np.float32), (W, H), interpolation=cv2.INTER_CUBIC), (0, 0), 20)
-    d = ((0.25 + 0.35 * (f - f.min()) / (np.ptp(f) + 1e-6)) * scope_mask(im))[..., None]
-    return (cv2.GaussianBlur(im.astype(np.float32), (0, 0), 1.5) * (1 - d) + 205 * d).clip(0, 255).astype(np.uint8)
+    f = cv2.resize(_rng.random((5, 8)).astype(np.float32), (W, H), interpolation=cv2.INTER_CUBIC)
+    f = cv2.GaussianBlur(f, (0, 0), min(H, W) / 12)
+    f = (f - f.min()) / (np.ptp(f) + 1e-6)
+    d = np.clip((f - 0.45) / 0.55, 0, 1) ** 1.3 * 0.65 + 0.04          # plumes up to ~0.7, thin veil elsewhere
+    d = (d * np.clip(scope_mask(im) * 1.5 - 0.5, 0, 1))[..., None]   # hard edge: border stays black
+    x = im.astype(np.float32)
+    soft = cv2.GaussianBlur(x, (0, 0), 2.5)
+    x = x * (1 - d) + (soft * 0.35 + 225 * 0.65) * d                     # smoke softens and whitens what is behind it
+    return x.clip(0, 255).astype(np.uint8)
 def c_glare(im):
-    H, W = im.shape[:2]; sm = scope_mask(im); g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    inside = g[sm > 0]; thr = np.percentile(inside, 85) if inside.size else 255
-    ys, xs = np.where((sm > 0) & (g >= thr)); mask = np.zeros((H, W), np.float32)
-    for i in (_rng.choice(len(xs), size=min(len(xs), int(_rng.integers(4, 9))), replace=False) if len(xs) else []):
-        cv2.ellipse(mask, (int(xs[i]), int(ys[i])), (int(_rng.integers(W // 45, W // 18)), int(_rng.integers(H // 60, H // 25))),
-                    float(_rng.integers(0, 180)), 0, 360, 1.0, -1)
-    mask = (cv2.GaussianBlur(mask, (0, 0), 2) * sm)[..., None]
-    return (im.astype(np.float32) * (1 - mask) + 250 * mask).clip(0, 255).astype(np.uint8)
+    """Specular highlights: many small, sharp, elongated spots with a hard core and a faint halo, on already-bright areas."""
+    H, W = im.shape[:2]; sm = scope_mask(im)
+    g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    inside = g[sm > 0.5]; thr = np.percentile(inside, 80) if inside.size else 255
+    ys, xs = np.where((sm > 0.5) & (g >= thr))
+    core = np.zeros((H, W), np.float32)
+    n = int(_rng.integers(8, 16)) if len(xs) else 0
+    for i in (_rng.choice(len(xs), size=min(n, len(xs)), replace=False) if n else []):
+        a = int(_rng.integers(max(2, W // 120), max(3, W // 35))); b = max(1, int(a * _rng.uniform(0.2, 0.5)))
+        cv2.ellipse(core, (int(xs[i]), int(ys[i])), (a, b), float(_rng.uniform(0, 180)), 0, 360, 1.0, -1)
+    core = cv2.GaussianBlur(core, (0, 0), 1.0)
+    halo = cv2.GaussianBlur(core, (0, 0), 6) * 0.45
+    m = (np.clip(core + halo, 0, 1) * sm)[..., None]
+    return (im.astype(np.float32) * (1 - m) + 252 * m).clip(0, 255).astype(np.uint8)
 CORRUPTIONS = dict(blur=c_blur, motion=c_motion, dark=c_dark, smoke=c_smoke, red=c_red, noise=c_noise, glare=c_glare)
 # NOTE: smoke/glare assume a round scope view with a black border. Check the preview before trusting them.
 
@@ -233,8 +246,8 @@ def make_harsh(img_dir, lbl_dir, out_root, names, conds=None):
         for p in imgs: cv2.imwrite(str(d / 'images' / p.name), CORRUPTIONS[c](cv2.imread(str(p))))
         for cache in d.glob('*.cache'): cache.unlink()
         write_data_yaml(d / 'data.yaml', d, names, train='images', val='images')
-    p = imgs[0]; tiles = [cv2.resize(cv2.imread(str(p)), (320, 180))] + \
-        [cv2.resize(cv2.imread(str(out_root / c / 'images' / p.name)), (320, 180)) for c in conds]
+    p = imgs[0]; im0 = cv2.imread(str(p)); th = int(320 * im0.shape[0] / im0.shape[1])
+    tiles = [cv2.resize(im0, (320, th))] + [cv2.resize(cv2.imread(str(out_root / c / 'images' / p.name)), (320, th)) for c in conds]
     cv2.imwrite(str(out_root / 'preview.png'), np.hstack(tiles)); print('preview ->', out_root / 'preview.png', '| order: clean,', conds)
 
 def harsh_eval(models, clean_yaml, harsh_root, clean_split='test', conds=None):
